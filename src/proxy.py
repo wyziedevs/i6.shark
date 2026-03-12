@@ -215,6 +215,7 @@ async def handle(request):
 
     # Use semaphore to limit concurrent requests
     async with _request_semaphore:
+        connector = None
         try:
             # Pick a pre-configured IP from the pool
             source_ip = _get_random_ip()
@@ -304,7 +305,7 @@ async def handle(request):
             print(f"Unexpected error: {e}")
             return web.Response(text=f"Error: {e}.", status=500)
         finally:
-            if 'connector' in locals():
+            if connector is not None:
                 await connector.close()
 
 async def on_startup(app):
@@ -323,6 +324,9 @@ async def on_startup(app):
 
     # Pre-build IP pool for faster request handling
     await _build_ip_pool()
+
+    # Start background IP pool refresh
+    asyncio.create_task(_refresh_ip_pool())
 
     print("Startup checks completed")
 

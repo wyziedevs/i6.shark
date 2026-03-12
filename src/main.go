@@ -43,6 +43,7 @@ const (
 	UnusedIPFlushInterval = 10 * time.Minute                   // Check for unused IPs every 10 minutes
 	IPInactivityThreshold = 30 * time.Minute                   // Remove IP if unused for this duration
 	MaxConcurrentPerIP    = 50                                 // Maximum concurrent requests per IP
+	BufferSize            = 128 * 1024                          // 128KB buffer size for I/O operations
 )
 
 // IPUsageTracker tracks usage statistics for each IP address
@@ -92,7 +93,7 @@ var skipHeaders = map[string]bool{
 
 // bufferPool is used to reduce allocations when copying response bodies
 var bufferPool = sync.Pool{New: func() interface{} {
-	b := make([]byte, 128*1024) // 128KB buffer for better throughput
+	b := make([]byte, BufferSize)
 	return &b
 }}
 
@@ -128,8 +129,8 @@ func createTransportForIP(sourceIP net.IP) *http.Transport {
 		ResponseHeaderTimeout: RequestTimeout,
 		DisableKeepAlives:     false,
 		DisableCompression:    true, // Let target handle compression
-		WriteBufferSize:       128 * 1024, // 128KB write buffer
-		ReadBufferSize:        128 * 1024, // 128KB read buffer
+		WriteBufferSize:       BufferSize,
+		ReadBufferSize:        BufferSize,
 	}
 }
 
@@ -767,8 +768,8 @@ func main() {
 		ResponseHeaderTimeout: RequestTimeout,
 		DisableKeepAlives:     false,
 		DisableCompression:    true,
-		WriteBufferSize:       128 * 1024,
-		ReadBufferSize:        128 * 1024,
+		WriteBufferSize:       BufferSize,
+		ReadBufferSize:        BufferSize,
 	}
 	defaultClient = &http.Client{
 		Transport: defaultTransport,
