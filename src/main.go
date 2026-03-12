@@ -35,14 +35,15 @@ const (
 	ListenHost            = "0.0.0.0"                          // Listen on all interfaces
 	RequestTimeout        = 30 * time.Second                   // Request timeout in seconds
 	Debug                 = false                              // Enable debug output
-	DesiredPoolSize       = 250                                // Target number of IPs in the pool
+	DesiredPoolSize       = 500                                // Target number of IPs in the pool
 	PoolManageInterval    = 500 * time.Millisecond             // Check pool frequently
-	PoolAddBatchSize      = 25                                 // Larger batches for faster pool growth
+	PoolAddBatchSize      = 50                                 // Larger batches for faster pool growth
 	IPFlushInterval       = 1 * time.Hour                      // Flush all IPs every hour
-	MaxRequestsPerIP      = 100                                // Maximum requests allowed per IP before rotation
+	MaxRequestsPerIP      = 500                                // Maximum requests allowed per IP before rotation
 	UnusedIPFlushInterval = 10 * time.Minute                   // Check for unused IPs every 10 minutes
 	IPInactivityThreshold = 30 * time.Minute                   // Remove IP if unused for this duration
-	MaxConcurrentPerIP    = 15                                 // Maximum concurrent requests per IP
+	MaxConcurrentPerIP    = 50                                 // Maximum concurrent requests per IP
+	BufferSize            = 128 * 1024                          // 128KB buffer size for I/O operations
 )
 
 // IPUsageTracker tracks usage statistics for each IP address
@@ -61,7 +62,17 @@ func (t *IPUsageTracker) GetInUseCount() int32   { return t.inUseCount.Load() }
 func (t *IPUsageTracker) GetLastUsed() time.Time { return time.Unix(0, t.lastUsed.Load()) }
 func (t *IPUsageTracker) IncrementRequestCount() { t.requestCount.Add(1) }
 func (t *IPUsageTracker) UpdateLastUsed()        { t.lastUsed.Store(time.Now().UnixNano()) }
-func (t *IPUsageTracker) AcquireUse() bool       { return t.inUseCount.Add(1) <= MaxConcurrentPerIP }
+func (t *IPUsageTracker) AcquireUse() bool {
+	for {
+		current := t.inUseCount.Load()
+		if current >= MaxConcurrentPerIP {
+			return false
+		}
+		if t.inUseCount.CompareAndSwap(current, current+1) {
+			return true
+		}
+	}
+}
 func (t *IPUsageTracker) ReleaseUse()            { t.inUseCount.Add(-1) }
 
 var (
@@ -82,7 +93,7 @@ var skipHeaders = map[string]bool{
 
 // bufferPool is used to reduce allocations when copying response bodies
 var bufferPool = sync.Pool{New: func() interface{} {
-	b := make([]byte, 64*1024) // 64KB buffer for better throughput
+	b := make([]byte, BufferSize)
 	return &b
 }}
 
@@ -110,14 +121,16 @@ func createTransportForIP(sourceIP net.IP) *http.Transport {
 	return &http.Transport{
 		DialContext:           dialer.DialContext,
 		ForceAttemptHTTP2:     false,            // HTTP/1.1 is faster for proxying
-		MaxIdleConns:          100,              // Pool connections
-		MaxIdleConnsPerHost:   10,               // Per-host pool
+		MaxIdleConns:          200,              // Pool connections
+		MaxIdleConnsPerHost:   25,               // Per-host pool
 		MaxConnsPerHost:       0,                // No limit per host
 		IdleConnTimeout:       90 * time.Second, // Keep connections alive
-		TLSHandshakeTimeout:   10 * time.Second,
+		TLSHandshakeTimeout:   5 * time.Second,
 		ResponseHeaderTimeout: RequestTimeout,
 		DisableKeepAlives:     false,
 		DisableCompression:    true, // Let target handle compression
+		WriteBufferSize:       BufferSize,
+		ReadBufferSize:        BufferSize,
 	}
 }
 
@@ -432,8 +445,6 @@ func getNextIPFromPool() (*IPUsageTracker, error) {
 
 		// Try to acquire usage slot
 		if !tracker.AcquireUse() {
-			// Too many concurrent users, release and try next
-			tracker.ReleaseUse()
 			continue
 		}
 
@@ -624,7 +635,7 @@ func manageIPPool() {
 
 				var wg sync.WaitGroup
 				newTrackers := make(chan *IPUsageTracker, target)
-				sem := make(chan struct{}, 5) // Limit concurrent IP additions
+				sem := make(chan struct{}, 10) // Limit concurrent IP additions
 
 				for i := 0; i < target; i++ {
 					wg.Add(1)
@@ -750,13 +761,15 @@ func main() {
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
 		ForceAttemptHTTP2:     false,
-		MaxIdleConns:          500,
-		MaxIdleConnsPerHost:   50,
+		MaxIdleConns:          1000,
+		MaxIdleConnsPerHost:   100,
 		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
+		TLSHandshakeTimeout:   5 * time.Second,
 		ResponseHeaderTimeout: RequestTimeout,
 		DisableKeepAlives:     false,
 		DisableCompression:    true,
+		WriteBufferSize:       BufferSize,
+		ReadBufferSize:        BufferSize,
 	}
 	defaultClient = &http.Client{
 		Transport: defaultTransport,
