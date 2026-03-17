@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -22,39 +23,15 @@ import (
 	"github.com/vishvananda/netlink"
 )
 
-// netlink uses syscall.AF_INET6 internally, we use the constant directly
-const FAMILY_V6 = 10 // AF_INET6
-
-const (
-	SharedSecret          = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" // Secret between client & server
-	Version               = "3.0"                              // Version of the script
-	IPv6Prefix            = "xxxx:xxxx:xxxx"                   // Your /48 prefix
-	IPv6Subnet            = "6000"                             // Using subnet 1000 within your /48
-	Interface             = "ens3"                             // Detected interface from your system
-	ListenPort            = 80                                 // Proxy server port
-	ListenHost            = "0.0.0.0"                          // Listen on all interfaces
-	RequestTimeout        = 30 * time.Second                   // Request timeout in seconds
-	Debug                 = false                              // Enable debug output
-	DesiredPoolSize       = 500                                // Target number of IPs in the pool
-	PoolManageInterval    = 500 * time.Millisecond             // Check pool frequently
-	PoolAddBatchSize      = 50                                 // Larger batches for faster pool growth
-	IPFlushInterval       = 1 * time.Hour                      // Flush all IPs every hour
-	MaxRequestsPerIP      = 500                                // Maximum requests allowed per IP before rotation
-	UnusedIPFlushInterval = 10 * time.Minute                   // Check for unused IPs every 10 minutes
-	IPInactivityThreshold = 30 * time.Minute                   // Remove IP if unused for this duration
-	MaxConcurrentPerIP    = 50                                 // Maximum concurrent requests per IP
-	BufferSize            = 128 * 1024                          // 128KB buffer size for I/O operations
-)
-
 // IPUsageTracker tracks usage statistics for each IP address
 type IPUsageTracker struct {
-	IP           string          // The IPv6 address
 	requestCount atomic.Int32    // Number of requests made with this IP
 	lastUsed     atomic.Int64    // Last time this IP was used (Unix nano)
-	Added        time.Time       // When this IP was added to the pool
 	inUseCount   atomic.Int32    // Number of ongoing requests using this IP
-	transport    *http.Transport // Cached transport for this IP - CRITICAL for performance
+	transport    *http.Transport // Cached transport for this IP
 	client       *http.Client    // Cached client for this IP
+	IP           string          // The IPv6 address
+	Added        time.Time       // When this IP was added to the pool
 }
 
 func (t *IPUsageTracker) GetRequestCount() int32 { return t.requestCount.Load() }
@@ -73,88 +50,77 @@ func (t *IPUsageTracker) AcquireUse() bool {
 		}
 	}
 }
-func (t *IPUsageTracker) ReleaseUse()            { t.inUseCount.Add(-1) }
+func (t *IPUsageTracker) ReleaseUse() { t.inUseCount.Add(-1) }
 
 var (
 	requestCount   atomic.Int64
 	defaultClient  *http.Client
-	ipPool         atomic.Pointer[[]*IPUsageTracker] // Lock-free pool access for reads
-	poolWriteMutex sync.Mutex                        // Only used for pool modifications
-	currentIndex   atomic.Uint32                     // Lock-free round-robin index
-	urgentAddChan  = make(chan struct{}, 10)
+	ipPool         atomic.Pointer[[]*IPUsageTracker]
+	poolWriteMutex sync.Mutex
+	currentIndex   atomic.Uint32
+	urgentAddChan  = make(chan struct{}, UrgentAddChanSize)
+	cachedLink     atomic.Pointer[netlink.Link] // Cache the netlink handle
 )
 
-var skipHeaders = map[string]bool{
-	"transfer-encoding": true,
-	"connection":        true,
-	"keep-alive":        true,
-	"server":            true,
-}
-
-// bufferPool is used to reduce allocations when copying response bodies
 var bufferPool = sync.Pool{New: func() interface{} {
 	b := make([]byte, BufferSize)
 	return &b
 }}
 
-var headersToStripBeforeForwarding = map[string]bool{
-	"cf-connecting-ip":  true,
-	"cf-ipcountry":      true,
-	"cf-ray":            true,
-	"cf-visitor":        true,
-	"cf-worker":         true,
-	"cf-ew-via":         true,
-	"x-forwarded-for":   true,
-	"x-forwarded-proto": true,
-	"cdn-loop":          true,
-	"true-client-ip":    true,
-	"x-real-ip":         true,
+// getLink returns the cached netlink handle, refreshing if needed
+func getLink() (netlink.Link, error) {
+	if link := cachedLink.Load(); link != nil {
+		return *link, nil
+	}
+	link, err := netlink.LinkByName(Interface)
+	if err != nil {
+		return nil, err
+	}
+	cachedLink.Store(&link)
+	return link, nil
 }
 
 // createTransportForIP creates a transport for a specific source IP
 func createTransportForIP(sourceIP net.IP) *http.Transport {
 	dialer := &net.Dialer{
 		LocalAddr: &net.TCPAddr{IP: sourceIP, Port: 0},
-		Timeout:   10 * time.Second,
-		KeepAlive: 30 * time.Second,
+		Timeout:   DialTimeout,
+		KeepAlive: KeepAliveInterval,
 	}
 	return &http.Transport{
 		DialContext:           dialer.DialContext,
-		ForceAttemptHTTP2:     false,            // HTTP/1.1 is faster for proxying
-		MaxIdleConns:          200,              // Pool connections
-		MaxIdleConnsPerHost:   25,               // Per-host pool
-		MaxConnsPerHost:       0,                // No limit per host
-		IdleConnTimeout:       90 * time.Second, // Keep connections alive
-		TLSHandshakeTimeout:   5 * time.Second,
+		ForceAttemptHTTP2:     false,
+		MaxIdleConns:          PerIPMaxIdleConns,
+		MaxIdleConnsPerHost:   PerIPMaxIdleConnsPerHost,
+		MaxConnsPerHost:       0,
+		IdleConnTimeout:       IdleConnTimeout,
+		TLSHandshakeTimeout:   TLSHandshakeTimeout,
 		ResponseHeaderTimeout: RequestTimeout,
 		DisableKeepAlives:     false,
-		DisableCompression:    true, // Let target handle compression
+		DisableCompression:    true,
 		WriteBufferSize:       BufferSize,
 		ReadBufferSize:        BufferSize,
 	}
 }
 
-// createIPTracker creates a new IP tracker with cached transport
 func createIPTracker(ip string) *IPUsageTracker {
 	parsedIP := net.ParseIP(ip)
 	transport := createTransportForIP(parsedIP)
-	tracker := &IPUsageTracker{
+	return &IPUsageTracker{
 		IP:        ip,
 		Added:     time.Now(),
 		transport: transport,
 		client: &http.Client{
 			Transport: transport,
 			Timeout:   RequestTimeout,
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				if len(via) >= 10 {
+					return http.ErrUseLastResponse
+				}
+				return nil
+			},
 		},
 	}
-	return tracker
-}
-
-func minInt(x, y int) int {
-	if x < y {
-		return x
-	}
-	return y
 }
 
 func normalizeIPv6(ipStr string) string {
@@ -170,35 +136,18 @@ func randomIPv6() string {
 	hostPart2 := rand.Uint32()
 
 	rawIP := fmt.Sprintf("%s:%s:%x:%x:%x:%x",
-		IPv6Prefix,
-		IPv6Subnet,
-		(hostPart1>>16)&0xFFFF,
-		hostPart1&0xFFFF,
-		(hostPart2>>16)&0xFFFF,
-		hostPart2&0xFFFF)
+		IPv6Prefix, IPv6Subnet,
+		(hostPart1>>16)&0xFFFF, hostPart1&0xFFFF,
+		(hostPart2>>16)&0xFFFF, hostPart2&0xFFFF)
 
 	ip := net.ParseIP(rawIP)
 	if ip == nil {
 		return fmt.Sprintf("%s:%s:%04x:%04x:%04x:%04x",
-			IPv6Prefix,
-			IPv6Subnet,
-			(hostPart1>>16)&0xFFFF,
-			hostPart1&0xFFFF,
-			(hostPart2>>16)&0xFFFF,
-			hostPart2&0xFFFF)
+			IPv6Prefix, IPv6Subnet,
+			(hostPart1>>16)&0xFFFF, hostPart1&0xFFFF,
+			(hostPart2>>16)&0xFFFF, hostPart2&0xFFFF)
 	}
 	return ip.String()
-}
-
-func checkInterface() bool {
-	link, err := netlink.LinkByName(Interface)
-	if err != nil {
-		return false
-	}
-	if (link.Attrs().Flags & net.FlagUp) == 0 {
-		return false
-	}
-	return true
 }
 
 func addIPv6ToInterface(ipv6 string) bool {
@@ -211,7 +160,7 @@ func addIPv6ToInterface(ipv6 string) bool {
 			}
 		}()
 
-		link, err := netlink.LinkByName(Interface)
+		link, err := getLink()
 		if err != nil {
 			done <- false
 			return
@@ -238,13 +187,13 @@ func addIPv6ToInterface(ipv6 string) bool {
 	select {
 	case result := <-done:
 		return result
-	case <-time.After(2 * time.Second):
+	case <-time.After(IPAddTimeout):
 		return false
 	}
 }
 
 func removeIPv6FromInterface(ipv6 string) bool {
-	link, err := netlink.LinkByName(Interface)
+	link, err := getLink()
 	if err != nil {
 		return false
 	}
@@ -254,22 +203,19 @@ func removeIPv6FromInterface(ipv6 string) bool {
 		return false
 	}
 
-	for attempt := 0; attempt < 3; attempt++ {
-		err = netlink.AddrDel(link, addr)
-		if err == nil {
-			return true
-		}
-		if strings.Contains(err.Error(), "cannot assign requested address") ||
-			strings.Contains(err.Error(), "no such file or directory") {
-			return true
-		}
-		time.Sleep(time.Duration(attempt+1) * 10 * time.Millisecond)
+	err = netlink.AddrDel(link, addr)
+	if err == nil {
+		return true
+	}
+	if strings.Contains(err.Error(), "cannot assign requested address") ||
+		strings.Contains(err.Error(), "no such file or directory") {
+		return true
 	}
 	return false
 }
 
 func flushAllIPAddresses() {
-	link, err := netlink.LinkByName(Interface)
+	link, err := getLink()
 	if err != nil {
 		return
 	}
@@ -280,7 +226,7 @@ func flushAllIPAddresses() {
 	}
 
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, 20) // Limit concurrent operations
+	sem := make(chan struct{}, IPFlushConcurrency)
 
 	for _, addr := range addrs {
 		ipStr := addr.IP.String()
@@ -297,7 +243,6 @@ func flushAllIPAddresses() {
 
 	wg.Wait()
 
-	// Clear the IP pool
 	poolWriteMutex.Lock()
 	newPool := make([]*IPUsageTracker, 0, DesiredPoolSize)
 	ipPool.Store(&newPool)
@@ -343,7 +288,6 @@ func flushUnusedIPs() {
 
 		if inactiveTime > IPInactivityThreshold && tracker.GetRequestCount() < MaxRequestsPerIP {
 			ipsToRemove = append(ipsToRemove, tracker.IP)
-			// Close transport to release resources
 			tracker.transport.CloseIdleConnections()
 		} else {
 			newPool = append(newPool, tracker)
@@ -352,7 +296,6 @@ func flushUnusedIPs() {
 
 	ipPool.Store(&newPool)
 
-	// Remove from interface in background
 	if len(ipsToRemove) > 0 {
 		go func(toRemove []string) {
 			for _, ip := range toRemove {
@@ -372,7 +315,7 @@ func periodicUnusedIPFlush() {
 }
 
 func cleanupWrongSubnetIPs() {
-	link, err := netlink.LinkByName(Interface)
+	link, err := getLink()
 	if err != nil {
 		return
 	}
@@ -438,17 +381,14 @@ func getNextIPFromPool() (*IPUsageTracker, error) {
 		idx := (startIdx + attempts) % poolLen
 		tracker := (*pool)[idx]
 
-		// Check if IP can handle more requests
 		if tracker.GetRequestCount() >= MaxRequestsPerIP {
 			continue
 		}
 
-		// Try to acquire usage slot
 		if !tracker.AcquireUse() {
 			continue
 		}
 
-		// Successfully acquired
 		tracker.IncrementRequestCount()
 		tracker.UpdateLastUsed()
 
@@ -460,7 +400,13 @@ func getNextIPFromPool() (*IPUsageTracker, error) {
 		return tracker, nil
 	}
 
-	// All IPs exhausted or busy - try any available IP
+	// All IPs exhausted or busy — signal for more and try fallback
+	select {
+	case urgentAddChan <- struct{}{}:
+	default:
+	}
+
+	// Last resort: try any IP ignoring MaxRequestsPerIP
 	for attempts := uint32(0); attempts < poolLen; attempts++ {
 		idx := (startIdx + attempts) % poolLen
 		tracker := (*pool)[idx]
@@ -519,12 +465,12 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 				fmt.Printf("Pool error, using default: %v\n", poolErr)
 			}
 		} else {
-			client = tracker.client // Use cached client with pre-configured transport
+			client = tracker.client
 			defer tracker.ReleaseUse()
 		}
 	}
 
-	// Build forwarded headers efficiently
+	// Build forwarded headers — pre-allocate with capacity
 	forwardedHeaders := make(http.Header, len(r.Header))
 	for name, values := range r.Header {
 		lowerName := strings.ToLower(name)
@@ -534,7 +480,6 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 		forwardedHeaders[name] = values
 	}
 
-	// Apply custom headers
 	if headersJSON != "" {
 		var customHeaders map[string]string
 		if json.Unmarshal([]byte(headersJSON), &customHeaders) == nil {
@@ -550,7 +495,6 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Stream request body directly
 	if r.Body != nil && r.Body != http.NoBody && (r.ContentLength != 0 || len(r.TransferEncoding) > 0) {
 		outRequest.Body = r.Body
 		outRequest.ContentLength = r.ContentLength
@@ -571,7 +515,6 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, fmt.Sprintf("Error proxying request: %v.", err), http.StatusInternalServerError)
 		}
 
-		// Signal for more IPs if bind error
 		if strings.Contains(err.Error(), "bind: cannot assign requested address") {
 			select {
 			case urgentAddChan <- struct{}{}:
@@ -583,20 +526,21 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 	defer resp.Body.Close()
 
 	// Copy response headers
+	respHeader := w.Header()
 	for name, values := range resp.Header {
 		if !skipHeaders[strings.ToLower(name)] {
 			for _, value := range values {
-				w.Header().Add(name, value)
+				respHeader.Add(name, value)
 			}
 		}
 	}
 
 	w.WriteHeader(resp.StatusCode)
 
-	// Use pooled buffer for efficient streaming
+	// Use pooled buffer for zero-alloc streaming
 	bufPtr := bufferPool.Get().(*[]byte)
-	defer bufferPool.Put(bufPtr)
 	io.CopyBuffer(w, resp.Body, *bufPtr)
+	bufferPool.Put(bufPtr)
 }
 
 func manageIPPool() {
@@ -621,11 +565,19 @@ func manageIPPool() {
 			}
 		}
 
-		// Determine how many IPs to add
 		needToAdd := currentSize < DesiredPoolSize || availableIPs < DesiredPoolSize/4
-		batchTarget := minInt(PoolAddBatchSize, DesiredPoolSize-currentSize)
-		if availableIPs < 20 {
-			batchTarget = minInt(PoolAddBatchSize*2, DesiredPoolSize-currentSize+20)
+		batchTarget := DesiredPoolSize - currentSize
+		if batchTarget > PoolAddBatchSize {
+			batchTarget = PoolAddBatchSize
+		}
+		if availableIPs < 30 {
+			emergency := PoolAddBatchSize * 2
+			if emergency > DesiredPoolSize-currentSize+30 {
+				emergency = DesiredPoolSize - currentSize + 30
+			}
+			if emergency > batchTarget {
+				batchTarget = emergency
+			}
 		}
 
 		if needToAdd && batchTarget > 0 {
@@ -635,7 +587,7 @@ func manageIPPool() {
 
 				var wg sync.WaitGroup
 				newTrackers := make(chan *IPUsageTracker, target)
-				sem := make(chan struct{}, 10) // Limit concurrent IP additions
+				sem := make(chan struct{}, IPAddConcurrency)
 
 				for i := 0; i < target; i++ {
 					wg.Add(1)
@@ -682,7 +634,6 @@ func manageIPPool() {
 						expectedPrefix := IPv6Prefix + ":" + IPv6Subnet + ":"
 						var toFlush []string
 
-						// Keep valid IPs, remove exhausted ones
 						for _, t := range *currentPool {
 							if !strings.HasPrefix(t.IP, expectedPrefix) {
 								if t.GetInUseCount() == 0 {
@@ -703,7 +654,6 @@ func manageIPPool() {
 							}
 						}
 
-						// Flush old IPs in background
 						if len(toFlush) > 0 {
 							go func(ips []string) {
 								for _, ip := range ips {
@@ -737,7 +687,15 @@ func onStartup() bool {
 		return false
 	}
 
-	checkInterface()
+	link, err := getLink()
+	if err != nil {
+		log.Printf("WARNING: Interface %s not found: %v", Interface, err)
+		return false
+	}
+	if (link.Attrs().Flags & net.FlagUp) == 0 {
+		log.Printf("WARNING: Interface %s is down", Interface)
+		return false
+	}
 
 	time.Sleep(100 * time.Millisecond)
 	go flushAllIPAddresses()
@@ -750,21 +708,22 @@ func onStartup() bool {
 }
 
 func main() {
-	// Initialize the pool
+	// Use all available CPU cores
+	runtime.GOMAXPROCS(runtime.NumCPU())
+
 	emptyPool := make([]*IPUsageTracker, 0, DesiredPoolSize)
 	ipPool.Store(&emptyPool)
 
-	// Create default transport
 	defaultTransport := &http.Transport{
 		DialContext: (&net.Dialer{
-			Timeout:   10 * time.Second,
-			KeepAlive: 30 * time.Second,
+			Timeout:   DialTimeout,
+			KeepAlive: KeepAliveInterval,
 		}).DialContext,
 		ForceAttemptHTTP2:     false,
-		MaxIdleConns:          1000,
-		MaxIdleConnsPerHost:   100,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   5 * time.Second,
+		MaxIdleConns:          DefaultMaxIdleConns,
+		MaxIdleConnsPerHost:   DefaultMaxIdleConnsPerHost,
+		IdleConnTimeout:       IdleConnTimeout,
+		TLSHandshakeTimeout:   TLSHandshakeTimeout,
 		ResponseHeaderTimeout: RequestTimeout,
 		DisableKeepAlives:     false,
 		DisableCompression:    true,
@@ -780,7 +739,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Start background processes
 	go func() {
 		time.Sleep(1 * time.Second)
 		cleanupWrongSubnetIPs()
@@ -800,14 +758,15 @@ func main() {
 	server := &http.Server{
 		Addr:              fmt.Sprintf("%s:%d", ListenHost, ListenPort),
 		Handler:           http.HandlerFunc(handleRequest),
-		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      60 * time.Second,
-		IdleTimeout:       120 * time.Second,
-		ReadHeaderTimeout: 10 * time.Second,
-		MaxHeaderBytes:    1 << 20, // 1MB
+		ReadTimeout:       ServerReadTimeout,
+		WriteTimeout:      ServerWriteTimeout,
+		IdleTimeout:       ServerIdleTimeout,
+		ReadHeaderTimeout: ServerHeaderTimeout,
+		MaxHeaderBytes:    MaxHeaderSize,
 	}
 
-	fmt.Printf("Starting i6.shark server v%s on %s\n", Version, server.Addr)
+	fmt.Printf("Starting i6.shark server v%s on %s (GOMAXPROCS=%d, pool=%d)\n",
+		Version, server.Addr, runtime.GOMAXPROCS(0), DesiredPoolSize)
 	err := server.ListenAndServe()
 	if err != nil {
 		log.Fatalf("Error starting server: %v", err)
