@@ -400,7 +400,7 @@ func getNextIPFromPool() (*IPUsageTracker, error) {
 		return tracker, nil
 	}
 
-	// All IPs exhausted or busy — signal for more and try fallback
+	// All IPs exhausted or busy - signal for more and try fallback
 	select {
 	case urgentAddChan <- struct{}{}:
 	default:
@@ -470,7 +470,7 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Build forwarded headers — pre-allocate with capacity
+	// Build forwarded headers - pre-allocate with capacity
 	forwardedHeaders := make(http.Header, len(r.Header))
 	for name, values := range r.Header {
 		lowerName := strings.ToLower(name)
