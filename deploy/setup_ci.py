@@ -12,6 +12,7 @@ Reads I6_HOST, I6_USER (default root) and I6_PASS. Needs paramiko, ssh-keygen
 and gh (logged in, with access to the repo). Safe to re-run: the key line is
 only added once, and the secrets are overwritten with the new key.
 """
+import getpass
 import os
 import shutil
 import subprocess
@@ -24,13 +25,11 @@ REPO = "wyziedevs/i6.shark"
 
 
 def main():
-    host = os.environ.get("I6_HOST")
+    host = os.environ.get("I6_HOST") or input("Proxy server IP (not the Cloudflare hostname): ").strip()
     user = os.environ.get("I6_USER", "root")
-    password = os.environ.get("I6_PASS")
-    if not password:
-        sys.exit("I6_PASS not set (the proxy server's root password, used this once).")
-    if not host:
-        sys.exit("I6_HOST not set (the proxy server's address, not the Cloudflare hostname).")
+    password = os.environ.get("I6_PASS") or getpass.getpass(f"{user}@{host} password (used this once): ")
+    if not password or not host:
+        sys.exit("Need the server's address and root password.")
     for tool in ("ssh-keygen", "gh"):
         if not shutil.which(tool):
             sys.exit(f"{tool} not found on PATH.")
