@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -86,6 +87,7 @@ func createTransportForIP(sourceIP net.IP) *http.Transport {
 		LocalAddr: &net.TCPAddr{IP: sourceIP, Port: 0},
 		Timeout:   DialTimeout,
 		KeepAlive: KeepAliveInterval,
+		Control:   guardedDialControl,
 	}
 	return &http.Transport{
 		DialContext:           dialer.DialContext,
@@ -111,14 +113,9 @@ func createIPTracker(ip string) *IPUsageTracker {
 		Added:     time.Now(),
 		transport: transport,
 		client: &http.Client{
-			Transport: transport,
-			Timeout:   RequestTimeout,
-			CheckRedirect: func(req *http.Request, via []*http.Request) error {
-				if len(via) >= 10 {
-					return http.ErrUseLastResponse
-				}
-				return nil
-			},
+			Transport:     transport,
+			Timeout:       RequestTimeout,
+			CheckRedirect: checkRedirect,
 		},
 	}
 }
@@ -344,11 +341,25 @@ func cleanupWrongSubnetIPs() {
 	wg.Wait()
 }
 
+// ensureURLHasScheme adds https:// only when the URL has no scheme at all, so
+// ftp://, file:// and the like reach validateTargetURL and are refused instead
+// of being mangled into a host name.
 func ensureURLHasScheme(urlStr string) string {
-	if !strings.HasPrefix(urlStr, "http://") && !strings.HasPrefix(urlStr, "https://") {
-		return "https://" + urlStr
+	if scheme, _, found := strings.Cut(urlStr, "://"); found && isURLScheme(scheme) {
+		return urlStr
 	}
-	return urlStr
+	return "https://" + urlStr
+}
+
+// isURLScheme reports whether s is a syntactically valid URL scheme (RFC 3986)
+func isURLScheme(s string) bool {
+	for i, c := range s {
+		isLetter := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+		if !isLetter && (i == 0 || !((c >= '0' && c <= '9') || c == '+' || c == '-' || c == '.')) {
+			return false
+		}
+	}
+	return s != ""
 }
 
 func logRequest(r *http.Request) {
@@ -471,6 +482,12 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 
 	logRequest(r)
 
+	if !allowedMethods[r.Method] {
+		w.Header().Set("Allow", "GET, HEAD, POST")
+		http.Error(w, fmt.Sprintf("Method %s not allowed.", r.Method), http.StatusMethodNotAllowed)
+		return
+	}
+
 	targetURL := strings.TrimSpace(r.URL.Query().Get("url"))
 	headersJSON := r.URL.Query().Get("headers")
 	useNormalParam := r.URL.Query().Has("normal")
@@ -484,6 +501,10 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 	parsedURL, err := url.Parse(targetURL)
 	if err != nil || parsedURL.Host == "" {
 		http.Error(w, fmt.Sprintf("Invalid URL: %s.", targetURL), http.StatusBadRequest)
+		return
+	}
+	if err := validateTargetURL(parsedURL); err != nil {
+		http.Error(w, fmt.Sprintf("Forbidden: %v.", err), http.StatusForbidden)
 		return
 	}
 
@@ -535,6 +556,11 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := client.Do(outRequest)
 	if err != nil {
+		if errors.Is(err, errBlockedDestination) {
+			// The wrapped error names the address the host resolved to; keep that out of the reply
+			http.Error(w, fmt.Sprintf("Forbidden: %s resolves or redirects to a destination i6.shark will not connect to.", parsedURL.Host), http.StatusForbidden)
+			return
+		}
 		if os.IsTimeout(err) || strings.Contains(err.Error(), "timeout") {
 			http.Error(w, fmt.Sprintf("Request timed out connecting to %s.", parsedURL.Host), http.StatusGatewayTimeout)
 		} else if strings.Contains(err.Error(), "connection") {
@@ -735,17 +761,14 @@ func onStartup() bool {
 	return true
 }
 
-func main() {
-	// Use all available CPU cores
-	runtime.GOMAXPROCS(runtime.NumCPU())
-
-	emptyPool := make([]*IPUsageTracker, 0, DesiredPoolSize)
-	ipPool.Store(&emptyPool)
-
+// newDefaultClient builds the client used for ?normal requests and when the
+// pool has no free IP; it dials from the system default address.
+func newDefaultClient() *http.Client {
 	defaultTransport := &http.Transport{
 		DialContext: (&net.Dialer{
 			Timeout:   DialTimeout,
 			KeepAlive: KeepAliveInterval,
+			Control:   guardedDialControl,
 		}).DialContext,
 		ForceAttemptHTTP2:     false,
 		MaxIdleConns:          DefaultMaxIdleConns,
@@ -758,10 +781,23 @@ func main() {
 		WriteBufferSize:       BufferSize,
 		ReadBufferSize:        BufferSize,
 	}
-	defaultClient = &http.Client{
-		Transport: defaultTransport,
-		Timeout:   RequestTimeout,
+	return &http.Client{
+		Transport:     defaultTransport,
+		Timeout:       RequestTimeout,
+		CheckRedirect: checkRedirect,
 	}
+}
+
+func main() {
+	// Use all available CPU cores
+	runtime.GOMAXPROCS(runtime.NumCPU())
+
+	loadSelfPrefixes()
+
+	emptyPool := make([]*IPUsageTracker, 0, DesiredPoolSize)
+	ipPool.Store(&emptyPool)
+
+	defaultClient = newDefaultClient()
 
 	if !onStartup() {
 		os.Exit(1)

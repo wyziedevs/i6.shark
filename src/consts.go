@@ -50,6 +50,9 @@ const (
 	IPAddConcurrency   = 20 // Concurrent IP additions to interface
 	IPFlushConcurrency = 30 // Concurrent IP removals from interface
 	UrgentAddChanSize  = 20
+
+	// Security
+	MaxRedirects = 5 // Redirects followed per proxied request
 )
 
 // FAMILY_V6 is AF_INET6 used by netlink
@@ -61,6 +64,13 @@ var skipHeaders = map[string]bool{
 	"connection":        true,
 	"keep-alive":        true,
 	"server":            true,
+}
+
+// allowedMethods are the only request methods the proxy forwards
+var allowedMethods = map[string]bool{
+	"GET":  true,
+	"HEAD": true,
+	"POST": true,
 }
 
 // forwardedHeaderAllowlist is the set of request headers (lowercase) passed
@@ -84,4 +94,12 @@ var forwardedHeaderAllowlist = map[string]bool{
 	"user-agent":        true,
 	"x-requested-with":  true,
 	"x-user-agent":      true, // OpenSubtitles identifies API clients by it
+}
+
+// allowedPorts are the destination ports the proxy connects to: 80/443 plus
+// the other HTTP(S) ports Cloudflare proxies, so sites on those still work
+// while mail, database, SSH, etc. ports are never reachable through the proxy.
+var allowedPorts = map[uint16]bool{
+	80: true, 8080: true, 8880: true, 2052: true, 2082: true, 2086: true, 2095: true,
+	443: true, 8443: true, 2053: true, 2083: true, 2087: true, 2096: true,
 }
