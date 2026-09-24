@@ -4,6 +4,22 @@ An IPv6 proxy server that allows you to make HTTP requests from randomly generat
 
 Docs moved to [docs.wyzie.io](https://docs.wyzie.io/i6shark/intro).
 
+## Shared secret
+
+Clients authenticate with an `API-Token` header: HMAC-SHA256 keyed by the request's `User-Agent`, over the shared secret, hex encoded. The server reads the secret from the `I6_SHARED_SECRET` environment variable at startup. If the variable is unset it falls back to the `SharedSecret` constant in `src/consts.go` and logs a warning, so set it and keep the real secret out of the source.
+
+With the systemd unit from the docs, keep the secret in a root-only file:
+
+```bash
+sudo install -m 600 /dev/null /etc/i6shark.env
+sudoedit /etc/i6shark.env      # one line: I6_SHARED_SECRET=<your secret>
+sudo systemctl edit i6shark    # add under [Service]: EnvironmentFile=/etc/i6shark.env
+sudo systemctl restart i6shark
+journalctl -u i6shark -n 20    # no "I6_SHARED_SECRET is not set" warning means it was picked up
+```
+
+To rotate, change the value in `/etc/i6shark.env` and on every client (the same secret on both sides), then restart the service.
+
 ## What gets proxied
 
 - Methods: `GET`, `HEAD` and `POST` only.

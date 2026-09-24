@@ -3,7 +3,7 @@ package main
 import "time"
 
 const (
-	SharedSecret = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" // Secret between client & server
+	SharedSecret = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" // Fallback only; set I6_SHARED_SECRET instead
 	Version      = "3.1"                              // Version of the script
 	IPv6Prefix   = "xxxx:xxxx:xxxx"                   // Your /48 prefix
 	IPv6Subnet   = "6000"                             // Using subnet 6000 within your /48
@@ -52,7 +52,8 @@ const (
 	UrgentAddChanSize  = 20
 
 	// Security
-	MaxRedirects = 5 // Redirects followed per proxied request
+	SharedSecretEnv = "I6_SHARED_SECRET" // Env var holding the shared secret (overrides SharedSecret)
+	MaxRedirects    = 5                  // Redirects followed per proxied request
 )
 
 // FAMILY_V6 is AF_INET6 used by netlink

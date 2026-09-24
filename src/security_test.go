@@ -219,8 +219,9 @@ func TestBuildForwardedHeaders(t *testing.T) {
 }
 
 func TestHandleRequestRefusesInternalTargets(t *testing.T) {
-	savedClient := defaultClient
-	t.Cleanup(func() { defaultClient = savedClient })
+	savedSecret, savedClient := sharedSecret, defaultClient
+	t.Cleanup(func() { sharedSecret, defaultClient = savedSecret, savedClient })
+	sharedSecret = "test-secret"
 	defaultClient = newDefaultClient()
 
 	userAgent := "Mozilla/5.0 (test)"
@@ -237,12 +238,33 @@ func TestHandleRequestRefusesInternalTargets(t *testing.T) {
 	for _, c := range cases {
 		req := httptest.NewRequest(c.method, "/?url="+url.QueryEscape(c.target)+"&normal", nil)
 		req.Header.Set("User-Agent", userAgent)
-		req.Header.Set("API-Token", testToken(userAgent, SharedSecret))
+		req.Header.Set("API-Token", testToken(userAgent, "test-secret"))
 		rec := httptest.NewRecorder()
 		handleRequest(rec, req)
 		if rec.Code != c.wantStatus {
 			t.Errorf("%s %s: status %d, want %d (%s)", c.method, c.target, rec.Code, c.wantStatus, rec.Body.String())
 		}
+	}
+}
+
+func TestLoadSharedSecret(t *testing.T) {
+	saved := sharedSecret
+	t.Cleanup(func() { sharedSecret = saved })
+	userAgent := "Mozilla/5.0 (test)"
+
+	t.Setenv(SharedSecretEnv, " rotated-secret\n")
+	loadSharedSecret()
+	if !validateAPIToken(testToken(userAgent, "rotated-secret"), userAgent) {
+		t.Error("token made with the env secret was rejected")
+	}
+	if validateAPIToken(testToken(userAgent, SharedSecret), userAgent) {
+		t.Error("token made with the fallback const was accepted while the env secret is set")
+	}
+
+	t.Setenv(SharedSecretEnv, "")
+	loadSharedSecret()
+	if sharedSecret != SharedSecret {
+		t.Error("unset env var should fall back to the SharedSecret const")
 	}
 }
 

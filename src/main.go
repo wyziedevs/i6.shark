@@ -61,6 +61,7 @@ var (
 	currentIndex   atomic.Uint32
 	urgentAddChan  = make(chan struct{}, UrgentAddChanSize)
 	cachedLink     atomic.Pointer[netlink.Link] // Cache the netlink handle
+	sharedSecret   = SharedSecret               // Replaced from I6_SHARED_SECRET by loadSharedSecret
 )
 
 var bufferPool = sync.Pool{New: func() interface{} {
@@ -369,10 +370,23 @@ func logRequest(r *http.Request) {
 	}
 }
 
+// loadSharedSecret reads the secret shared with clients from I6_SHARED_SECRET,
+// so it can be rotated without a code change. The SharedSecret const is only
+// a fallback for deployments that have not set the variable yet.
+func loadSharedSecret() {
+	if secret := strings.TrimSpace(os.Getenv(SharedSecretEnv)); secret != "" {
+		sharedSecret = secret
+		return
+	}
+	sharedSecret = SharedSecret
+	log.Printf("WARNING: %s is not set; falling back to the SharedSecret constant in consts.go. Set %s and rotate the secret.",
+		SharedSecretEnv, SharedSecretEnv)
+}
+
 func validateAPIToken(apiToken string, userAgent string) bool {
 	key := []byte(userAgent)
 	h := hmac.New(sha256.New, key)
-	h.Write([]byte(SharedSecret))
+	h.Write([]byte(sharedSecret))
 	expectedHash := hex.EncodeToString(h.Sum(nil))
 	return hmac.Equal([]byte(apiToken), []byte(expectedHash))
 }
@@ -792,6 +806,7 @@ func main() {
 	// Use all available CPU cores
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
+	loadSharedSecret()
 	loadSelfPrefixes()
 
 	emptyPool := make([]*IPUsageTracker, 0, DesiredPoolSize)
