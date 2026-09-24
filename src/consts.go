@@ -63,17 +63,25 @@ var skipHeaders = map[string]bool{
 	"server":            true,
 }
 
-// headersToStripBeforeForwarding removes client identity headers
-var headersToStripBeforeForwarding = map[string]bool{
-	"cf-connecting-ip":  true,
-	"cf-ipcountry":      true,
-	"cf-ray":            true,
-	"cf-visitor":        true,
-	"cf-worker":         true,
-	"cf-ew-via":         true,
-	"x-forwarded-for":   true,
-	"x-forwarded-proto": true,
-	"cdn-loop":          true,
-	"true-client-ip":    true,
-	"x-real-ip":         true,
+// forwardedHeaderAllowlist is the set of request headers (lowercase) passed
+// on to the target; Sec-Ch-Ua* and Sec-Fetch-* are allowed by prefix in
+// isForwardableHeader. Everything else is dropped, notably API-Token, Host,
+// hop-by-hop headers and client identity headers (CF-*, X-Forwarded-*,
+// X-Real-IP, True-Client-IP, Forwarded).
+var forwardedHeaderAllowlist = map[string]bool{
+	"accept":            true,
+	"accept-encoding":   true,
+	"accept-language":   true,
+	"cache-control":     true,
+	"content-type":      true,
+	"cookie":            true,
+	"if-modified-since": true,
+	"if-none-match":     true,
+	"origin":            true,
+	"pragma":            true,
+	"range":             true,
+	"referer":           true,
+	"user-agent":        true,
+	"x-requested-with":  true,
+	"x-user-agent":      true, // OpenSubtitles identifies API clients by it
 }

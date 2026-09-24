@@ -421,6 +421,45 @@ func getNextIPFromPool() (*IPUsageTracker, error) {
 	return nil, fmt.Errorf("all IPs busy")
 }
 
+// isForwardableHeader reports whether a request header (lowercase name) may be
+// sent on to the target.
+func isForwardableHeader(lowerName string) bool {
+	return forwardedHeaderAllowlist[lowerName] ||
+		strings.HasPrefix(lowerName, "sec-ch-ua") ||
+		strings.HasPrefix(lowerName, "sec-fetch-")
+}
+
+// buildForwardedHeaders merges the incoming headers with the ?headers= JSON
+// overrides and only then applies the allowlist, so neither source can send
+// API-Token, Host, hop-by-hop or client identity headers upstream.
+func buildForwardedHeaders(incoming http.Header, custom map[string]string) http.Header {
+	merged := make(http.Header, len(incoming)+len(custom))
+	for name, values := range incoming {
+		merged[name] = values
+	}
+	for name, value := range custom {
+		merged.Set(name, value)
+	}
+
+	// Headers named in Connection are hop-by-hop for this request too
+	connectionScoped := make(map[string]bool)
+	for _, value := range merged.Values("Connection") {
+		for _, token := range strings.Split(value, ",") {
+			connectionScoped[strings.ToLower(strings.TrimSpace(token))] = true
+		}
+	}
+
+	forwarded := make(http.Header, len(merged))
+	for name, values := range merged {
+		lowerName := strings.ToLower(name)
+		if connectionScoped[lowerName] || !isForwardableHeader(lowerName) {
+			continue
+		}
+		forwarded[name] = values
+	}
+	return forwarded
+}
+
 func handleRequest(w http.ResponseWriter, r *http.Request) {
 	apiToken := r.Header.Get("API-Token")
 	userAgent := r.Header.Get("User-Agent")
@@ -470,24 +509,13 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Build forwarded headers - pre-allocate with capacity
-	forwardedHeaders := make(http.Header, len(r.Header))
-	for name, values := range r.Header {
-		lowerName := strings.ToLower(name)
-		if lowerName == "host" || headersToStripBeforeForwarding[lowerName] {
-			continue
-		}
-		forwardedHeaders[name] = values
-	}
-
+	var customHeaders map[string]string
 	if headersJSON != "" {
-		var customHeaders map[string]string
-		if json.Unmarshal([]byte(headersJSON), &customHeaders) == nil {
-			for name, value := range customHeaders {
-				forwardedHeaders.Set(name, value)
-			}
+		if json.Unmarshal([]byte(headersJSON), &customHeaders) != nil {
+			customHeaders = nil
 		}
 	}
+	forwardedHeaders := buildForwardedHeaders(r.Header, customHeaders)
 
 	outRequest, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL, nil)
 	if err != nil {
