@@ -6,7 +6,7 @@ Makes an SSH key just for GitHub Actions, installs its public half on the VPS
 log in, stores host, user and private key as repo secrets with the GitHub CLI,
 deletes the local copy of the key, and starts a first deploy.
 
-  I6_HOST=<server ip> I6_PASS=... python deploy/setup_ci.py
+  python deploy/setup_ci.py   (asks for the IP and password)
 
 Reads I6_HOST, I6_USER (default root) and I6_PASS. Needs paramiko, ssh-keygen
 and gh (logged in, with access to the repo). Safe to re-run: the key line is
