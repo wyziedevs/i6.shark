@@ -2,8 +2,8 @@ name: Deploy
 
 # Push to main = deploy to the proxy server over SSH (deploy/update.sh keeps the
 # server's own settings, checks the new build and rolls back on failure).
-# Needs repo secrets I6_VPS_HOST, I6_VPS_USER, I6_VPS_SSH_KEY, written once by
-# deploy/setup_ci.py; until they exist every run is skipped. Optional secret
+# Needs repo secrets I6_VPS_HOST, I6_VPS_USER, I6_VPS_SSH_KEY, set once by hand
+# (a CI-only SSH key in the server's authorized_keys); until they exist every run is skipped. Optional secret
 # I6_SHARED_SECRET sets the proxy's shared secret. This repo is public: the
 # scripts never print secret values.
 
@@ -20,9 +20,9 @@ jobs:
     env:
       READY: ${{ secrets.I6_VPS_SSH_KEY != '' && secrets.I6_VPS_HOST != '' }}
     steps:
-      - name: Skip until deploy/setup_ci.py has run
+      - name: Skip until the deploy secrets are set
         if: env.READY != 'true'
-        run: echo "::notice::I6_VPS_* secrets are not set; run deploy/setup_ci.py once. Nothing deployed."
+        run: echo "::notice::I6_VPS_* secrets are not set. Nothing deployed."
 
       - name: Update, rebuild, check
         if: env.READY == 'true'
